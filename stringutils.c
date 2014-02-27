@@ -651,8 +651,7 @@ PHP_FUNCTION(len)
     charset = determine_charset(charset_hint TSRMLS_CC);
 
     while (pos < size) {
-        pos = next_pos;
-        this_char = get_next_char(charset, (const unsigned char *) str, size, &next_pos, &status);
+        this_char = get_next_char(charset, (const unsigned char *) str, size, &pos, &status);
         ++len;
     }
  
