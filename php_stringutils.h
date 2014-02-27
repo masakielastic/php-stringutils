@@ -44,7 +44,8 @@ PHP_RINIT_FUNCTION(stringutils);
 PHP_RSHUTDOWN_FUNCTION(stringutils);
 PHP_MINFO_FUNCTION(stringutils);
 
-PHP_FUNCTION(str_check_encoding);	/* For testing, remove later. */
+PHP_FUNCTION(str_check_encoding);
+PHP_FUNCTION(str_scrub);
 
 /* 
   	Declare any global variables you may need between the BEGIN

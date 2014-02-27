@@ -12,7 +12,7 @@
   | obtain it through the world-wide-web, please send a note to          |
   | license@php.net so we can mail you a copy immediately.               |
   +----------------------------------------------------------------------+
-  | Author:                                                              |
+  | Author: Masaki Kagaya                                                |
   +----------------------------------------------------------------------+
 */
 
@@ -26,6 +26,7 @@
 #include "php_ini.h"
 #include "ext/standard/info.h"
 #include "php_stringutils.h"
+#include "ext/standard/php_smart_str.h"
 
 #if HAVE_LOCALE_H
 #include <locale.h>
@@ -76,7 +77,8 @@ static int le_stringutils;
  * Every user visible function must have an entry in stringutils_functions[].
  */
 const zend_function_entry stringutils_functions[] = {
-	PHP_FE(str_check_encoding,	NULL)		/* For testing, remove later. */
+	PHP_FE(str_check_encoding,	NULL)
+	PHP_FE(str_scrub,	NULL)
 	PHP_FE_END	/* Must be the last line in stringutils_functions[] */
 };
 /* }}} */
@@ -574,7 +576,56 @@ PHP_FUNCTION(str_check_encoding)
 }
 
 
+PHP_FUNCTION(str_scrub)
+{
+    char *str;
+    int size;
+    char *charset_hint;
+    size_t charset_hint_size;
+    enum entity_charset charset;
+    size_t pos = 0;
+    size_t next_pos = 0;
+    int status = 0;
+    unsigned int this_char;
+    smart_str buf = {0};
+    char *substitute; 
+    int substitute_size;
 
+    charset_hint = "UTF-8";
+
+    if (zend_parse_parameters(
+            ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &str, &size, &charset_hint, &charset_hint_size) == FAILURE
+    ) {
+        return;
+    }
+
+    charset = determine_charset(charset_hint TSRMLS_CC);
+
+    if (strncasecmp(charset_hint, "UTF-8", charset_hint_size) == 0) {
+        substitute_size = 3;
+        substitute = calloc(substitute_size, sizeof(char)); 
+        strncpy(substitute, "\xEF\xBF\xBD", substitute_size);
+    } else {
+        substitute_size = 1;
+        substitute = calloc(substitute_size, sizeof(char));
+        strncpy(substitute, "\x3F", substitute_size);
+    }
+
+    while (next_pos < size) {
+        pos = next_pos;
+        this_char = get_next_char(charset, (const unsigned char *) str, size, &next_pos, &status);
+
+        if (status == SUCCESS) {
+            smart_str_appendl(&buf, str + pos, next_pos - pos);
+        } else {
+            smart_str_appendl(&buf, substitute, substitute_size); 
+        }
+    }
+
+    smart_str_0(&buf);
+    RETURN_STRINGL(buf.c, buf.len, 0);
+    smart_str_free(&buf);
+}
 /*
  * Local variables:
  * tab-width: 4
