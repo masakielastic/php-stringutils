@@ -27,6 +27,43 @@
 #include "ext/standard/info.h"
 #include "php_stringutils.h"
 
+#if HAVE_LOCALE_H
+#include <locale.h>
+#endif
+#if PHP_WIN32
+#include "config.w32.h"
+#else
+#include <php_config.h>
+#endif
+
+#include "SAPI.h"
+#if HAVE_LANGINFO_H
+#include <langinfo.h>
+#endif
+
+/* https://github.com/php/php-src/blob/master/ext/standard/html.c */
+
+#define MB_FAILURE(pos, advance) do { \
+  *cursor = pos + (advance); \
+  *status = FAILURE; \
+  return 0; \
+} while (0)
+
+#define CHECK_LEN(pos, chars_need) ((str_len - (pos)) >= (chars_need))
+
+/* valid as single byte character or leading byte */
+#define utf8_lead(c)  ((c) < 0x80 || ((c) >= 0xC2 && (c) <= 0xF4))
+/* whether it's actually valid depends on other stuff;
+ * this macro cannot check for non-shortest forms, surrogates or
+ * code points above 0x10FFFF */
+#define utf8_trail(c) ((c) >= 0x80 && (c) <= 0xBF)
+
+#define gb2312_lead(c) ((c) != 0x8E && (c) != 0x8F && (c) != 0xA0 && (c) != 0xFF)
+#define gb2312_trail(c) ((c) >= 0xA1 && (c) <= 0xFE)
+
+#define sjis_lead(c) ((c) != 0x80 && (c) != 0xA0 && (c) < 0xFD)
+#define sjis_trail(c) ((c) >= 0x40  && (c) != 0x7F && (c) < 0xFD)
+
 /* If you declare any globals in php_stringutils.h uncomment this:
 ZEND_DECLARE_MODULE_GLOBALS(stringutils)
 */
@@ -39,7 +76,7 @@ static int le_stringutils;
  * Every user visible function must have an entry in stringutils_functions[].
  */
 const zend_function_entry stringutils_functions[] = {
-	PHP_FE(confirm_stringutils_compiled,	NULL)		/* For testing, remove later. */
+	PHP_FE(str_check_encoding,	NULL)		/* For testing, remove later. */
 	PHP_FE_END	/* Must be the last line in stringutils_functions[] */
 };
 /* }}} */
@@ -143,33 +180,399 @@ PHP_MINFO_FUNCTION(stringutils)
 }
 /* }}} */
 
-
-/* Remove the following function when you have successfully modified config.m4
-   so that your module can be compiled into PHP, it exists only for testing
-   purposes. */
-
-/* Every user-visible function in PHP should document itself in the source */
-/* {{{ proto string confirm_stringutils_compiled(string arg)
-   Return a string to confirm that the module is compiled in */
-PHP_FUNCTION(confirm_stringutils_compiled)
+/* {{{ get_next_char
+ */
+static inline unsigned int get_next_char(
+		enum entity_charset charset,
+		const unsigned char *str,
+		size_t str_len,
+		size_t *cursor,
+		int *status)
 {
-	char *arg = NULL;
-	int arg_len, len;
-	char *strg;
+	size_t pos = *cursor;
+	unsigned int this_char = 0;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &arg, &arg_len) == FAILURE) {
-		return;
+	*status = SUCCESS;
+	assert(pos <= str_len);
+
+	if (!CHECK_LEN(pos, 1))
+		MB_FAILURE(pos, 1);
+
+	switch (charset) {
+	case cs_utf_8:
+		{
+			/* We'll follow strategy 2. from section 3.6.1 of UTR #36:
+			 * "In a reported illegal byte sequence, do not include any
+			 *  non-initial byte that encodes a valid character or is a leading
+			 *  byte for a valid sequence." */
+			unsigned char c;
+			c = str[pos];
+			if (c < 0x80) {
+				this_char = c;
+				pos++;
+			} else if (c < 0xc2) {
+				MB_FAILURE(pos, 1);
+			} else if (c < 0xe0) {
+				if (!CHECK_LEN(pos, 2))
+					MB_FAILURE(pos, 1);
+
+				if (!utf8_trail(str[pos + 1])) {
+					MB_FAILURE(pos, utf8_lead(str[pos + 1]) ? 1 : 2);
+				}
+				this_char = ((c & 0x1f) << 6) | (str[pos + 1] & 0x3f);
+				if (this_char < 0x80) { /* non-shortest form */
+					MB_FAILURE(pos, 2);
+				}
+				pos += 2;
+			} else if (c < 0xf0) {
+				size_t avail = str_len - pos;
+
+				if (avail < 3 ||
+						!utf8_trail(str[pos + 1]) || !utf8_trail(str[pos + 2])) {
+					if (avail < 2 || utf8_lead(str[pos + 1]))
+						MB_FAILURE(pos, 1);
+					else if (avail < 3 || utf8_lead(str[pos + 2]))
+						MB_FAILURE(pos, 2);
+					else
+						MB_FAILURE(pos, 3);
+				}
+
+				this_char = ((c & 0x0f) << 12) | ((str[pos + 1] & 0x3f) << 6) | (str[pos + 2] & 0x3f);
+				if (this_char < 0x800) { /* non-shortest form */
+					MB_FAILURE(pos, 3);
+				} else if (this_char >= 0xd800 && this_char <= 0xdfff) { /* surrogate */
+					MB_FAILURE(pos, 3);
+				}
+				pos += 3;
+			} else if (c < 0xf5) {
+				size_t avail = str_len - pos;
+
+				if (avail < 4 ||
+						!utf8_trail(str[pos + 1]) || !utf8_trail(str[pos + 2]) ||
+						!utf8_trail(str[pos + 3])) {
+					if (avail < 2 || utf8_lead(str[pos + 1]))
+						MB_FAILURE(pos, 1);
+					else if (avail < 3 || utf8_lead(str[pos + 2]))
+						MB_FAILURE(pos, 2);
+					else if (avail < 4 || utf8_lead(str[pos + 3]))
+						MB_FAILURE(pos, 3);
+					else
+						MB_FAILURE(pos, 4);
+				}
+				
+				this_char = ((c & 0x07) << 18) | ((str[pos + 1] & 0x3f) << 12) | ((str[pos + 2] & 0x3f) << 6) | (str[pos + 3] & 0x3f);
+				if (this_char < 0x10000 || this_char > 0x10FFFF) { /* non-shortest form or outside range */
+					MB_FAILURE(pos, 4);
+				}
+				pos += 4;
+			} else {
+				MB_FAILURE(pos, 1);
+			}
+		}
+		break;
+
+	case cs_big5:
+		/* reference http://demo.icu-project.org/icu-bin/convexp?conv=big5 */
+		{
+			unsigned char c = str[pos];
+			if (c >= 0x81 && c <= 0xFE) {
+				unsigned char next;
+				if (!CHECK_LEN(pos, 2))
+					MB_FAILURE(pos, 1);
+
+				next = str[pos + 1];
+
+				if ((next >= 0x40 && next <= 0x7E) ||
+						(next >= 0xA1 && next <= 0xFE)) {
+					this_char = (c << 8) | next;
+				} else {
+					MB_FAILURE(pos, 1);
+				}
+				pos += 2;
+			} else {
+				this_char = c;
+				pos += 1;
+			}
+		}
+		break;
+
+	case cs_big5hkscs:
+		{
+			unsigned char c = str[pos];
+			if (c >= 0x81 && c <= 0xFE) {
+				unsigned char next;
+				if (!CHECK_LEN(pos, 2))
+					MB_FAILURE(pos, 1);
+
+				next = str[pos + 1];
+
+				if ((next >= 0x40 && next <= 0x7E) ||
+						(next >= 0xA1 && next <= 0xFE)) {
+					this_char = (c << 8) | next;
+				} else if (next != 0x80 && next != 0xFF) {
+					MB_FAILURE(pos, 1);
+				} else {
+					MB_FAILURE(pos, 2);
+				}
+				pos += 2;
+			} else {
+				this_char = c;
+				pos += 1;
+			}
+		}
+		break;
+
+	case cs_gb2312: /* EUC-CN */
+		{
+			unsigned char c = str[pos];
+			if (c >= 0xA1 && c <= 0xFE) {
+				unsigned char next;
+				if (!CHECK_LEN(pos, 2))
+					MB_FAILURE(pos, 1);
+
+				next = str[pos + 1];
+
+				if (gb2312_trail(next)) {
+					this_char = (c << 8) | next;
+				} else if (gb2312_lead(next)) {
+					MB_FAILURE(pos, 1);
+				} else {
+					MB_FAILURE(pos, 2);
+				}
+				pos += 2;
+			} else if (gb2312_lead(c)) {
+				this_char = c;
+				pos += 1;
+			} else {
+				MB_FAILURE(pos, 1);
+			}
+		}
+		break;
+
+	case cs_sjis:
+		{
+			unsigned char c = str[pos];
+			if ((c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC)) {
+				unsigned char next;
+				if (!CHECK_LEN(pos, 2))
+					MB_FAILURE(pos, 1);
+
+				next = str[pos + 1];
+
+				if (sjis_trail(next)) {
+					this_char = (c << 8) | next;
+				} else if (sjis_lead(next)) {
+					MB_FAILURE(pos, 1);
+				} else {
+					MB_FAILURE(pos, 2);
+				}
+				pos += 2;
+			} else if (c < 0x80 || (c >= 0xA1 && c <= 0xDF)) {
+				this_char = c;
+				pos += 1;
+			} else {
+				MB_FAILURE(pos, 1);
+			}
+		}
+		break;
+
+	case cs_eucjp:
+		{
+			unsigned char c = str[pos];
+
+			if (c >= 0xA1 && c <= 0xFE) {
+				unsigned next;
+				if (!CHECK_LEN(pos, 2))
+					MB_FAILURE(pos, 1);
+				next = str[pos + 1];
+
+				if (next >= 0xA1 && next <= 0xFE) {
+					/* this a jis kanji char */
+					this_char = (c << 8) | next;
+				} else {
+					MB_FAILURE(pos, (next != 0xA0 && next != 0xFF) ? 1 : 2);
+				}
+				pos += 2;
+			} else if (c == 0x8E) {
+				unsigned next;
+				if (!CHECK_LEN(pos, 2))
+					MB_FAILURE(pos, 1);
+
+				next = str[pos + 1];
+				if (next >= 0xA1 && next <= 0xDF) {
+					/* JIS X 0201 kana */
+					this_char = (c << 8) | next;
+				} else {
+					MB_FAILURE(pos, (next != 0xA0 && next != 0xFF) ? 1 : 2);
+				}
+				pos += 2;
+			} else if (c == 0x8F) {
+				size_t avail = str_len - pos;
+
+				if (avail < 3 || !(str[pos + 1] >= 0xA1 && str[pos + 1] <= 0xFE) ||
+						!(str[pos + 2] >= 0xA1 && str[pos + 2] <= 0xFE)) {
+					if (avail < 2 || (str[pos + 1] != 0xA0 && str[pos + 1] != 0xFF))
+						MB_FAILURE(pos, 1);
+					else if (avail < 3 || (str[pos + 2] != 0xA0 && str[pos + 2] != 0xFF))
+						MB_FAILURE(pos, 2);
+					else
+						MB_FAILURE(pos, 3);
+				} else {
+					/* JIS X 0212 hojo-kanji */
+					this_char = (c << 16) | (str[pos + 1] << 8) | str[pos + 2];
+				}
+				pos += 3;
+			} else if (c != 0xA0 && c != 0xFF) {
+				/* character encoded in 1 code unit */
+				this_char = c;
+				pos += 1;
+			} else {
+				MB_FAILURE(pos, 1);
+			}
+		}
+		break;
+	default:
+		/* single-byte charsets */
+		this_char = str[pos++];
+		break;
 	}
 
-	len = spprintf(&strg, 0, "Congratulations! You have successfully modified ext/%.78s/config.m4. Module %.78s is now compiled into PHP.", "stringutils", arg);
-	RETURN_STRINGL(strg, len, 0);
+	*cursor = pos;
+  	return this_char;
 }
 /* }}} */
-/* The previous line is meant for vim and emacs, so it can correctly fold and 
-   unfold functions in source code. See the corresponding marks just before 
-   function definition, where the functions purpose is also documented. Please 
-   follow this convention for the convenience of others editing your code.
-*/
+
+/* {{{ entity_charset determine_charset
+ * returns the charset identifier based on current locale or a hint.
+ * defaults to UTF-8 */
+static enum entity_charset determine_charset(char *charset_hint TSRMLS_DC)
+{
+	int i;
+	enum entity_charset charset = cs_utf_8;
+	int len = 0;
+	const zend_encoding *zenc;
+
+	/* Default is now UTF-8 */
+	if (charset_hint == NULL)
+		return cs_utf_8;
+
+	if ((len = strlen(charset_hint)) != 0) {
+		goto det_charset;
+	}
+
+	zenc = zend_multibyte_get_internal_encoding(TSRMLS_C);
+	if (zenc != NULL) {
+		charset_hint = (char *)zend_multibyte_get_encoding_name(zenc);
+		if (charset_hint != NULL && (len=strlen(charset_hint)) != 0) {
+			if ((len == 4) /* sizeof (none|auto|pass) */ &&
+					(!memcmp("pass", charset_hint, 4) ||
+					 !memcmp("auto", charset_hint, 4) ||
+					 !memcmp("auto", charset_hint, 4))) {
+				charset_hint = NULL;
+				len = 0;
+			} else {
+				goto det_charset;
+			}
+		}
+	}
+
+	charset_hint = SG(default_charset);
+	if (charset_hint != NULL && (len=strlen(charset_hint)) != 0) {
+		goto det_charset;
+	}
+
+	/* try to detect the charset for the locale */
+#if HAVE_NL_LANGINFO && HAVE_LOCALE_H && defined(CODESET)
+	charset_hint = nl_langinfo(CODESET);
+	if (charset_hint != NULL && (len=strlen(charset_hint)) != 0) {
+		goto det_charset;
+	}
+#endif
+
+#if HAVE_LOCALE_H
+	/* try to figure out the charset from the locale */
+	{
+		char *localename;
+		char *dot, *at;
+
+		/* lang[_territory][.codeset][@modifier] */
+		localename = setlocale(LC_CTYPE, NULL);
+
+		dot = strchr(localename, '.');
+		if (dot) {
+			dot++;
+			/* locale specifies a codeset */
+			at = strchr(dot, '@');
+			if (at)
+				len = at - dot;
+			else
+				len = strlen(dot);
+			charset_hint = dot;
+		} else {
+			/* no explicit name; see if the name itself
+			 * is the charset */
+			charset_hint = localename;
+			len = strlen(charset_hint);
+		}
+	}
+#endif
+
+det_charset:
+
+	if (charset_hint) {
+		int found = 0;
+		
+		/* now walk the charset map and look for the codeset */
+		for (i = 0; charset_map[i].codeset; i++) {
+			if (len == strlen(charset_map[i].codeset) && strncasecmp(charset_hint, charset_map[i].codeset, len) == 0) {
+				charset = charset_map[i].charset;
+				found = 1;
+				break;
+			}
+		}
+		if (!found) {
+			php_error_docref(NULL TSRMLS_CC, E_WARNING, "charset `%s' not supported, assuming utf-8",
+					charset_hint);
+		}
+	}
+	return charset;
+}
+/* }}} */
+
+
+PHP_FUNCTION(str_check_encoding)
+{
+    char *str;
+    int size;
+    char *charset_hint;
+    size_t charset_hint_size;
+    enum entity_charset charset;
+    size_t cursor = 0;
+    int status = 0;
+    unsigned int this_char;
+
+    charset_hint = "UTF-8";
+
+    if (zend_parse_parameters(
+            ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &str, &size, &charset_hint, &charset_hint_size) == FAILURE
+    ) {
+        return;
+    }
+
+    charset = determine_charset(charset_hint TSRMLS_CC);
+
+    while (cursor < size) {
+        this_char = get_next_char(charset, (const unsigned char *) str, size, &cursor, &status);
+
+        if (status == FAILURE) {
+            RETURN_FALSE;
+        }
+
+    }
+
+    RETURN_TRUE;
+}
+
 
 
 /*
