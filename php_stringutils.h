@@ -46,6 +46,7 @@ PHP_MINFO_FUNCTION(stringutils);
 
 PHP_FUNCTION(str_check_encoding);
 PHP_FUNCTION(str_scrub);
+PHP_FUNCTION(len);
 
 /* 
   	Declare any global variables you may need between the BEGIN
