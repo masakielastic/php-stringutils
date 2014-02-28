@@ -48,6 +48,7 @@ PHP_FUNCTION(str_check_encoding);
 PHP_FUNCTION(str_scrub);
 PHP_FUNCTION(len);
 PHP_FUNCTION(str_to_array);
+PHP_FUNCTION(str_each_char);
 
 /* 
   	Declare any global variables you may need between the BEGIN
