@@ -78,8 +78,9 @@ static int le_stringutils;
  */
 const zend_function_entry stringutils_functions[] = {
 	PHP_FE(str_check_encoding,	NULL)
-	PHP_FE(str_scrub,	NULL)
+	PHP_FE(str_scrub, NULL)
 	PHP_FE(len,	NULL)
+	PHP_FE(str_to_array, NULL)
 	PHP_FE_END	/* Must be the last line in stringutils_functions[] */
 };
 /* }}} */
@@ -656,6 +657,37 @@ PHP_FUNCTION(len)
     }
  
     RETURN_LONG(len);
+}
+
+PHP_FUNCTION(str_to_array)
+{
+    char *str;
+    int size;
+    char *charset_hint;
+    size_t charset_hint_size;
+    enum entity_charset charset;
+    size_t pos = 0;
+    size_t next_pos = 0;
+    int status = 0;
+    unsigned int this_char;
+
+    charset_hint = "UTF-8";
+
+    if (zend_parse_parameters(
+        ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &str, &size, &charset_hint, &charset_hint_size) == FAILURE
+    ) {
+        return;
+    }
+
+    charset = determine_charset(charset_hint TSRMLS_CC);
+
+    array_init(return_value);
+
+    while (next_pos < size) {
+    	pos = next_pos;
+        this_char = get_next_char(charset, (const unsigned char *) str, size, &next_pos, &status);
+        add_next_index_stringl(return_value, str + pos, next_pos - pos, 1);
+    }
 }
 /*
  * Local variables:
