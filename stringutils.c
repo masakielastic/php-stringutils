@@ -82,6 +82,7 @@ const zend_function_entry stringutils_functions[] = {
 	PHP_FE(len,	NULL)
 	PHP_FE(str_to_array, NULL)
 	PHP_FE(str_each_char, NULL)
+	PHP_FE(str_take_while, NULL)
 	PHP_FE_END	/* Must be the last line in stringutils_functions[] */
 };
 /* }}} */
@@ -748,6 +749,83 @@ if (zend_parse_parameters(
 
         ++index;
 
+    }
+
+    smart_str_0(&buf);
+    RETVAL_STRINGL(buf.c, buf.len, 1);
+
+    smart_str_free(&buf);
+
+    if (retval_ptr) {
+        zval_ptr_dtor(&retval_ptr);
+    }
+
+    zval_ptr_dtor(&value);
+    zval_ptr_dtor(&key);
+}
+
+PHP_FUNCTION(str_take_while)
+{
+    char *str;
+    int size;
+    char *charset_hint;
+    size_t charset_hint_size;
+    enum entity_charset charset;
+    size_t pos = 0;
+    size_t next_pos = 0;
+    int status = 0;
+    unsigned int this_char;
+
+    smart_str buf = {0};
+    int index = 0;
+
+    zend_fcall_info fci;
+    zend_fcall_info_cache fci_cache;
+    zval **params[2];
+    zval *value = NULL;
+    zval *key = NULL;
+    zval *retval_ptr = NULL;
+
+    charset_hint = "UTF-8";
+
+if (zend_parse_parameters(
+            ZEND_NUM_ARGS() TSRMLS_CC, "sf|s", &str, &size, &fci, &fci_cache, &charset_hint, &charset_hint_size) == FAILURE
+    ) {
+        return;
+    }
+
+    charset = determine_charset(charset_hint TSRMLS_CC);
+
+    MAKE_STD_ZVAL(value);
+    MAKE_STD_ZVAL(key);
+
+    params[0] = &value;
+    params[1] = &key;
+
+    fci.param_count = 2;
+    fci.params = params;
+    fci.no_separation = 0;
+    fci.retval_ptr_ptr = &retval_ptr;
+
+    while (next_pos < size) {
+        pos = next_pos;
+        this_char = get_next_char(charset, (const unsigned char *) str, size, &next_pos, &status);
+
+        ZVAL_STRINGL(value, str + pos, next_pos - pos, 1);
+        ZVAL_LONG(key, index);
+
+        if (zend_call_function(&fci, &fci_cache TSRMLS_CC) == SUCCESS
+          && fci.retval_ptr_ptr && *fci.retval_ptr_ptr
+        ) {
+
+            if (zend_is_true(retval_ptr)) {
+                break;
+            }
+
+            smart_str_appendl(&buf, str + pos, next_pos - pos);  
+        }
+
+        ++index;
     }
 
     smart_str_0(&buf);
