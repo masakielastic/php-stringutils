@@ -50,6 +50,7 @@ PHP_FUNCTION(len);
 PHP_FUNCTION(str_to_array);
 PHP_FUNCTION(str_each_char);
 PHP_FUNCTION(str_take_while);
+PHP_FUNCTION(str_drop_while);
 
 /* 
   	Declare any global variables you may need between the BEGIN
