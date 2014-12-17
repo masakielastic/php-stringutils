@@ -287,7 +287,6 @@ size_t utf8_next_char(
         buf_len = 1;
     }
 
-    printf("%zu\n", buf_len);
     *cp = this_char;
 
     return buf_len;
