@@ -44,16 +44,16 @@
 
 /* https://github.com/php/php-src/blob/master/ext/standard/html.c */
 
-#define MB_FAILURE(pos, advance) do { \
-  *cursor = pos + (advance); \
+#define MB_FAILURE(advance) do { \
+  buf_len = (advance); \
   *status = FAILURE; \
-  return 0; \
+  return buf_len; \
 } while (0)
 
 #define CHECK_LEN(pos, chars_need) ((str_len - (pos)) >= (chars_need))
 
 /* valid as single byte character or leading byte */
-#define utf8_lead(c)  ((c) < 0x80 || ((c) >= 0xC2 && (c) <= 0xF4))
+#define utf8_lead(c) ((c) < 0x80 || ((c) >= 0xC2 && (c) <= 0xF4))
 /* whether it's actually valid depends on other stuff;
  * this macro cannot check for non-shortest forms, surrogates or
  * code points above 0x10FFFF */
@@ -187,389 +187,219 @@ PHP_MINFO_FUNCTION(stringutils)
 }
 /* }}} */
 
-/* {{{ get_next_char
- */
-static inline unsigned int get_next_char(
-		enum entity_charset charset,
-		const unsigned char *str,
-		size_t str_len,
-		size_t *cursor,
-		int *status)
+typedef size_t (*next_char_func) (
+    const unsigned char *,
+    size_t,
+    size_t,
+    int*,
+    unsigned int*
+);
+
+size_t utf8_next_char(
+    const unsigned char *str,
+    size_t str_len,
+    size_t pos,
+    int *status,
+    unsigned int *cp)
 {
-	size_t pos = *cursor;
+    assert(pos <= str_len);
+ 
+    *status = SUCCESS;
+
+    size_t buf_len = 0;
+    unsigned int this_char = 0;
+    unsigned char c = str[pos];
+ 
+    c = str[pos];
+
+    if (c < 0x80) {
+        this_char = c;
+        buf_len = 1;
+	} else if (c < 0xc2) {
+        MB_FAILURE(1);
+	} else if (c < 0xe0) {
+
+        if (!CHECK_LEN(pos, 2)) {
+            MB_FAILURE(1);
+        }
+
+        if (!utf8_trail(str[pos + 1])) {
+            MB_FAILURE(utf8_lead(str[pos + 1]) ? 1 : 2);
+        }
+
+        this_char = ((c & 0x1f) << 6) | (str[pos + 1] & 0x3f);
+
+        if (this_char < 0x80) { /* non-shortest form */
+            MB_FAILURE(2);
+        }
+
+        buf_len = 2;
+    } else if (c < 0xf0) {
+        size_t avail = str_len - pos;
+
+        if (avail < 3 ||
+            !utf8_trail(str[pos + 1]) || !utf8_trail(str[pos + 2])) {
+        if (avail < 2 || utf8_lead(str[pos + 1]))
+            MB_FAILURE(1);
+        } else if (avail < 3 || utf8_lead(str[pos + 2])) {
+            MB_FAILURE(2);
+        } else {
+            MB_FAILURE(3);
+        }
+
+        this_char = ((c & 0x0f) << 12) | ((str[pos + 1] & 0x3f) << 6) | (str[pos + 2] & 0x3f);
+
+        if (this_char < 0x800) { /* non-shortest form */
+            MB_FAILURE(3);
+        } else if (this_char >= 0xd800 && this_char <= 0xdfff) { /* surrogate */
+            MB_FAILURE(3);
+        }
+        buf_len = 3;
+    } else if (c < 0xf5) {
+        size_t avail = str_len - pos;
+
+        if (avail < 4 ||
+            !utf8_trail(str[pos + 1]) || !utf8_trail(str[pos + 2]) ||
+            !utf8_trail(str[pos + 3])
+        ) {
+
+		    if (avail < 2 || utf8_lead(str[pos + 1])) {
+                MB_FAILURE(1);
+            } else if (avail < 3 || utf8_lead(str[pos + 2])) {
+                MB_FAILURE(2);
+            } else if (avail < 4 || utf8_lead(str[pos + 3])) {
+                MB_FAILURE(3);
+            } else {
+                MB_FAILURE(4);
+            }			
+        }
+				
+        this_char = ((c & 0x07) << 18) | ((str[pos + 1] & 0x3f) << 12) | ((str[pos + 2] & 0x3f) << 6) | (str[pos + 3] & 0x3f);
+
+        if (this_char < 0x10000 || this_char > 0x10FFFF) {
+            /* non-shortest form or outside range */
+            MB_FAILURE(4);
+        }
+
+        buf_len = 4;
+    } else {
+        MB_FAILURE(1);
+        buf_len = 1;
+    }
+
+    printf("%zu\n", buf_len);
+    *cp = this_char;
+
+    return buf_len;
+}
+
+size_t sjis_next_char(
+    const unsigned char *str,
+    size_t str_len,
+    size_t pos,
+    int *status,
+    unsigned int *cp)
+{
+
 	unsigned int this_char = 0;
+    size_t buf_len = 0;
 
 	*status = SUCCESS;
+
 	assert(pos <= str_len);
 
-	if (!CHECK_LEN(pos, 1))
-		MB_FAILURE(pos, 1);
-
-	switch (charset) {
-	case cs_utf_8:
-		{
-			/* We'll follow strategy 2. from section 3.6.1 of UTR #36:
-			 * "In a reported illegal byte sequence, do not include any
-			 *  non-initial byte that encodes a valid character or is a leading
-			 *  byte for a valid sequence." */
-			unsigned char c;
-			c = str[pos];
-			if (c < 0x80) {
-				this_char = c;
-				pos++;
-			} else if (c < 0xc2) {
-				MB_FAILURE(pos, 1);
-			} else if (c < 0xe0) {
-				if (!CHECK_LEN(pos, 2))
-					MB_FAILURE(pos, 1);
-
-				if (!utf8_trail(str[pos + 1])) {
-					MB_FAILURE(pos, utf8_lead(str[pos + 1]) ? 1 : 2);
-				}
-				this_char = ((c & 0x1f) << 6) | (str[pos + 1] & 0x3f);
-				if (this_char < 0x80) { /* non-shortest form */
-					MB_FAILURE(pos, 2);
-				}
-				pos += 2;
-			} else if (c < 0xf0) {
-				size_t avail = str_len - pos;
-
-				if (avail < 3 ||
-						!utf8_trail(str[pos + 1]) || !utf8_trail(str[pos + 2])) {
-					if (avail < 2 || utf8_lead(str[pos + 1]))
-						MB_FAILURE(pos, 1);
-					else if (avail < 3 || utf8_lead(str[pos + 2]))
-						MB_FAILURE(pos, 2);
-					else
-						MB_FAILURE(pos, 3);
-				}
-
-				this_char = ((c & 0x0f) << 12) | ((str[pos + 1] & 0x3f) << 6) | (str[pos + 2] & 0x3f);
-				if (this_char < 0x800) { /* non-shortest form */
-					MB_FAILURE(pos, 3);
-				} else if (this_char >= 0xd800 && this_char <= 0xdfff) { /* surrogate */
-					MB_FAILURE(pos, 3);
-				}
-				pos += 3;
-			} else if (c < 0xf5) {
-				size_t avail = str_len - pos;
-
-				if (avail < 4 ||
-						!utf8_trail(str[pos + 1]) || !utf8_trail(str[pos + 2]) ||
-						!utf8_trail(str[pos + 3])) {
-					if (avail < 2 || utf8_lead(str[pos + 1]))
-						MB_FAILURE(pos, 1);
-					else if (avail < 3 || utf8_lead(str[pos + 2]))
-						MB_FAILURE(pos, 2);
-					else if (avail < 4 || utf8_lead(str[pos + 3]))
-						MB_FAILURE(pos, 3);
-					else
-						MB_FAILURE(pos, 4);
-				}
-				
-				this_char = ((c & 0x07) << 18) | ((str[pos + 1] & 0x3f) << 12) | ((str[pos + 2] & 0x3f) << 6) | (str[pos + 3] & 0x3f);
-				if (this_char < 0x10000 || this_char > 0x10FFFF) { /* non-shortest form or outside range */
-					MB_FAILURE(pos, 4);
-				}
-				pos += 4;
-			} else {
-				MB_FAILURE(pos, 1);
-			}
-		}
-		break;
-
-	case cs_big5:
-		/* reference http://demo.icu-project.org/icu-bin/convexp?conv=big5 */
-		{
-			unsigned char c = str[pos];
-			if (c >= 0x81 && c <= 0xFE) {
-				unsigned char next;
-				if (!CHECK_LEN(pos, 2))
-					MB_FAILURE(pos, 1);
-
-				next = str[pos + 1];
-
-				if ((next >= 0x40 && next <= 0x7E) ||
-						(next >= 0xA1 && next <= 0xFE)) {
-					this_char = (c << 8) | next;
-				} else {
-					MB_FAILURE(pos, 1);
-				}
-				pos += 2;
-			} else {
-				this_char = c;
-				pos += 1;
-			}
-		}
-		break;
-
-	case cs_big5hkscs:
-		{
-			unsigned char c = str[pos];
-			if (c >= 0x81 && c <= 0xFE) {
-				unsigned char next;
-				if (!CHECK_LEN(pos, 2))
-					MB_FAILURE(pos, 1);
-
-				next = str[pos + 1];
-
-				if ((next >= 0x40 && next <= 0x7E) ||
-						(next >= 0xA1 && next <= 0xFE)) {
-					this_char = (c << 8) | next;
-				} else if (next != 0x80 && next != 0xFF) {
-					MB_FAILURE(pos, 1);
-				} else {
-					MB_FAILURE(pos, 2);
-				}
-				pos += 2;
-			} else {
-				this_char = c;
-				pos += 1;
-			}
-		}
-		break;
-
-	case cs_gb2312: /* EUC-CN */
-		{
-			unsigned char c = str[pos];
-			if (c >= 0xA1 && c <= 0xFE) {
-				unsigned char next;
-				if (!CHECK_LEN(pos, 2))
-					MB_FAILURE(pos, 1);
-
-				next = str[pos + 1];
-
-				if (gb2312_trail(next)) {
-					this_char = (c << 8) | next;
-				} else if (gb2312_lead(next)) {
-					MB_FAILURE(pos, 1);
-				} else {
-					MB_FAILURE(pos, 2);
-				}
-				pos += 2;
-			} else if (gb2312_lead(c)) {
-				this_char = c;
-				pos += 1;
-			} else {
-				MB_FAILURE(pos, 1);
-			}
-		}
-		break;
-
-	case cs_sjis:
-		{
-			unsigned char c = str[pos];
-			if ((c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC)) {
-				unsigned char next;
-				if (!CHECK_LEN(pos, 2))
-					MB_FAILURE(pos, 1);
-
-				next = str[pos + 1];
-
-				if (sjis_trail(next)) {
-					this_char = (c << 8) | next;
-				} else if (sjis_lead(next)) {
-					MB_FAILURE(pos, 1);
-				} else {
-					MB_FAILURE(pos, 2);
-				}
-				pos += 2;
-			} else if (c < 0x80 || (c >= 0xA1 && c <= 0xDF)) {
-				this_char = c;
-				pos += 1;
-			} else {
-				MB_FAILURE(pos, 1);
-			}
-		}
-		break;
-
-	case cs_eucjp:
-		{
-			unsigned char c = str[pos];
-
-			if (c >= 0xA1 && c <= 0xFE) {
-				unsigned next;
-				if (!CHECK_LEN(pos, 2))
-					MB_FAILURE(pos, 1);
-				next = str[pos + 1];
-
-				if (next >= 0xA1 && next <= 0xFE) {
-					/* this a jis kanji char */
-					this_char = (c << 8) | next;
-				} else {
-					MB_FAILURE(pos, (next != 0xA0 && next != 0xFF) ? 1 : 2);
-				}
-				pos += 2;
-			} else if (c == 0x8E) {
-				unsigned next;
-				if (!CHECK_LEN(pos, 2))
-					MB_FAILURE(pos, 1);
-
-				next = str[pos + 1];
-				if (next >= 0xA1 && next <= 0xDF) {
-					/* JIS X 0201 kana */
-					this_char = (c << 8) | next;
-				} else {
-					MB_FAILURE(pos, (next != 0xA0 && next != 0xFF) ? 1 : 2);
-				}
-				pos += 2;
-			} else if (c == 0x8F) {
-				size_t avail = str_len - pos;
-
-				if (avail < 3 || !(str[pos + 1] >= 0xA1 && str[pos + 1] <= 0xFE) ||
-						!(str[pos + 2] >= 0xA1 && str[pos + 2] <= 0xFE)) {
-					if (avail < 2 || (str[pos + 1] != 0xA0 && str[pos + 1] != 0xFF))
-						MB_FAILURE(pos, 1);
-					else if (avail < 3 || (str[pos + 2] != 0xA0 && str[pos + 2] != 0xFF))
-						MB_FAILURE(pos, 2);
-					else
-						MB_FAILURE(pos, 3);
-				} else {
-					/* JIS X 0212 hojo-kanji */
-					this_char = (c << 16) | (str[pos + 1] << 8) | str[pos + 2];
-				}
-				pos += 3;
-			} else if (c != 0xA0 && c != 0xFF) {
-				/* character encoded in 1 code unit */
-				this_char = c;
-				pos += 1;
-			} else {
-				MB_FAILURE(pos, 1);
-			}
-		}
-		break;
-	default:
-		/* single-byte charsets */
-		this_char = str[pos++];
-		break;
+	if (!CHECK_LEN(pos, 1)) {
+        MB_FAILURE(1);
 	}
 
-	*cursor = pos;
-  	return this_char;
-}
-/* }}} */
+    unsigned char c = str[pos];
 
-/* {{{ entity_charset determine_charset
- * returns the charset identifier based on current locale or a hint.
- * defaults to UTF-8 */
-static enum entity_charset determine_charset(char *charset_hint TSRMLS_DC)
+    if ((c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC)) {
+        unsigned char next;
+
+        if (!CHECK_LEN(pos, 2)) {
+            MB_FAILURE(1);
+        }
+					
+        next = str[pos + 1];
+
+        if (sjis_trail(next)) {
+            this_char = (c << 8) | next;
+        } else if (sjis_lead(next)) {
+            MB_FAILURE(1);
+        } else {
+            MB_FAILURE(2);
+        }
+
+        buf_len = 2;
+    } else if (c < 0x80 || (c >= 0xA1 && c <= 0xDF)) {
+        *cp = c;
+        buf_len = 1;
+    } else {
+       MB_FAILURE(1);
+    }
+
+  	return buf_len;
+}
+
+next_char_func get_next_func(const char* charset)
 {
-	int i;
-	enum entity_charset charset = cs_utf_8;
-	int len = 0;
-	const zend_encoding *zenc;
+    static const struct {
+       const char *name;
+       next_char_func func;
+    } next_funcs[] = {
+      {"UTF-8", utf8_next_char},
+      {"Shift_JIS", sjis_next_char},
+      { NULL }
+    };
 
-	/* Default is now UTF-8 */
-	if (charset_hint == NULL)
-		return cs_utf_8;
+    size_t name_length;
+    int found = 0;
+    next_char_func func;
 
-	if ((len = strlen(charset_hint)) != 0) {
-		goto det_charset;
+    for (int i = 0; next_funcs[i].name; ++i) {
+        name_length = strlen(next_funcs[i].name);
+
+        if (strncasecmp((const char *) charset, next_funcs[i].name, name_length) == 0) {
+        	func = next_funcs[i].func;
+        	found = 1;
+        	break;
+        } 
+ 
+    }
+ 
+    if (!found) {
+        php_error_docref(NULL TSRMLS_CC, E_WARNING, "charset `%s' not supported, assuming utf-8",
+        charset);
 	}
 
-	zenc = zend_multibyte_get_internal_encoding(TSRMLS_C);
-	if (zenc != NULL) {
-		charset_hint = (char *)zend_multibyte_get_encoding_name(zenc);
-		if (charset_hint != NULL && (len=strlen(charset_hint)) != 0) {
-			if ((len == 4) /* sizeof (none|auto|pass) */ &&
-					(!memcmp("pass", charset_hint, 4) ||
-					 !memcmp("auto", charset_hint, 4) ||
-					 !memcmp("auto", charset_hint, 4))) {
-				charset_hint = NULL;
-				len = 0;
-			} else {
-				goto det_charset;
-			}
-		}
-	}
-
-	charset_hint = SG(default_charset);
-	if (charset_hint != NULL && (len=strlen(charset_hint)) != 0) {
-		goto det_charset;
-	}
-
-	/* try to detect the charset for the locale */
-#if HAVE_NL_LANGINFO && HAVE_LOCALE_H && defined(CODESET)
-	charset_hint = nl_langinfo(CODESET);
-	if (charset_hint != NULL && (len=strlen(charset_hint)) != 0) {
-		goto det_charset;
-	}
-#endif
-
-#if HAVE_LOCALE_H
-	/* try to figure out the charset from the locale */
-	{
-		char *localename;
-		char *dot, *at;
-
-		/* lang[_territory][.codeset][@modifier] */
-		localename = setlocale(LC_CTYPE, NULL);
-
-		dot = strchr(localename, '.');
-		if (dot) {
-			dot++;
-			/* locale specifies a codeset */
-			at = strchr(dot, '@');
-			if (at)
-				len = at - dot;
-			else
-				len = strlen(dot);
-			charset_hint = dot;
-		} else {
-			/* no explicit name; see if the name itself
-			 * is the charset */
-			charset_hint = localename;
-			len = strlen(charset_hint);
-		}
-	}
-#endif
-
-det_charset:
-
-	if (charset_hint) {
-		int found = 0;
-		
-		/* now walk the charset map and look for the codeset */
-		for (i = 0; charset_map[i].codeset; i++) {
-			if (len == strlen(charset_map[i].codeset) && strncasecmp(charset_hint, charset_map[i].codeset, len) == 0) {
-				charset = charset_map[i].charset;
-				found = 1;
-				break;
-			}
-		}
-		if (!found) {
-			php_error_docref(NULL TSRMLS_CC, E_WARNING, "charset `%s' not supported, assuming utf-8",
-					charset_hint);
-		}
-	}
-	return charset;
+    return func;
 }
-/* }}} */
-
 
 PHP_FUNCTION(str_check_encoding)
 {
     char *str;
-    int size;
+    int str_len;
     char *charset_hint;
     size_t charset_hint_size;
-    enum entity_charset charset;
-    size_t cursor = 0;
-    int status = 0;
-    unsigned int this_char;
 
-    charset_hint = "UTF-8";
+    next_char_func func = utf8_next_char;
+    size_t pos = 0;
+    size_t buf_len = 0;
+    int status = 0;
+    unsigned int cp = 0;
 
     if (zend_parse_parameters(
-            ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &str, &size, &charset_hint, &charset_hint_size) == FAILURE
+            ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &str, &str_len, &charset_hint, &charset_hint_size) == FAILURE
     ) {
         return;
     }
 
-    charset = determine_charset(charset_hint TSRMLS_CC);
+    func = get_next_func(charset_hint);
 
-    while (cursor < size) {
-        this_char = get_next_char(charset, (const unsigned char *) str, size, &cursor, &status);
+    while (pos < str_len) {
+        buf_len = func((const unsigned char *) str, str_len, pos, &status, &cp);
+        pos += buf_len;
 
         if (status == FAILURE) {
             RETURN_FALSE;
@@ -587,16 +417,15 @@ PHP_FUNCTION(str_scrub)
     int size;
     char *charset_hint;
     size_t charset_hint_size;
-    enum entity_charset charset;
+
+    next_char_func func = utf8_next_char;
     size_t pos = 0;
-    size_t next_pos = 0;
+    size_t buf_len = 0;
     int status = 0;
-    unsigned int this_char;
+
     smart_str buf = {0};
     char *substitute; 
     int substitute_size;
-
-    charset_hint = "UTF-8";
 
     if (zend_parse_parameters(
             ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &str, &size, &charset_hint, &charset_hint_size) == FAILURE
@@ -604,7 +433,7 @@ PHP_FUNCTION(str_scrub)
         return;
     }
 
-    charset = determine_charset(charset_hint TSRMLS_CC);
+    func = get_next_func(charset_hint);
 
     if (strncasecmp(charset_hint, "UTF-8", charset_hint_size) == 0) {
         substitute_size = 3;
@@ -616,15 +445,17 @@ PHP_FUNCTION(str_scrub)
         strncpy(substitute, "\x3F", substitute_size);
     }
 
-    while (next_pos < size) {
-        pos = next_pos;
-        this_char = get_next_char(charset, (const unsigned char *) str, size, &next_pos, &status);
+    while (pos < size) {
+
+        buf_len = func((const unsigned char *) str, size, pos, &status, NULL);
 
         if (status == SUCCESS) {
-            smart_str_appendl(&buf, str + pos, next_pos - pos);
+            smart_str_appendl(&buf, str + pos, buf_len);
         } else {
             smart_str_appendl(&buf, substitute, substitute_size); 
         }
+
+        pos += buf_len;
     }
 
     smart_str_0(&buf);
@@ -635,27 +466,28 @@ PHP_FUNCTION(str_scrub)
 PHP_FUNCTION(len)
 {
     char *str;
-    int size;
-    char *charset_hint;
+    int str_len;
+    char *charset_hint = "UTF-8";
     size_t charset_hint_size;
-    enum entity_charset charset;
+
+    next_char_func func;
     size_t pos = 0;
-    int status = 0;
-    unsigned int this_char;
+    size_t buf_len = 0;
+    int status = SUCCESS;
+    unsigned int cp = 0;
     int len = 0;
 
-    charset_hint = "UTF-8";
-
     if (zend_parse_parameters(
-            ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &str, &size, &charset_hint, &charset_hint_size) == FAILURE
+            ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &str, &str_len, &charset_hint, &charset_hint_size) == FAILURE
     ) {
         return;
     }
 
-    charset = determine_charset(charset_hint TSRMLS_CC);
+    func = get_next_func((const char*) charset_hint);
 
-    while (pos < size) {
-        this_char = get_next_char(charset, (const unsigned char *) str, size, &pos, &status);
+    while (pos < str_len) {
+        buf_len = func((const unsigned char *) str, str_len, pos, &status, &cp);
+        pos += buf_len;
         ++len;
     }
  
@@ -668,13 +500,12 @@ PHP_FUNCTION(str_to_array)
     int size;
     char *charset_hint;
     size_t charset_hint_size;
-    enum entity_charset charset;
-    size_t pos = 0;
-    size_t next_pos = 0;
-    int status = 0;
-    unsigned int this_char;
 
-    charset_hint = "UTF-8";
+    next_char_func func;
+    size_t pos = 0;
+    size_t buf_len = 0;
+    int status = 0;
+    unsigned int cp = 0;
 
     if (zend_parse_parameters(
         ZEND_NUM_ARGS() TSRMLS_CC, "s|s", &str, &size, &charset_hint, &charset_hint_size) == FAILURE
@@ -682,14 +513,14 @@ PHP_FUNCTION(str_to_array)
         return;
     }
 
-    charset = determine_charset(charset_hint TSRMLS_CC);
+    func = get_next_func(charset_hint);
 
     array_init(return_value);
 
-    while (next_pos < size) {
-    	pos = next_pos;
-        this_char = get_next_char(charset, (const unsigned char *) str, size, &next_pos, &status);
-        add_next_index_stringl(return_value, str + pos, next_pos - pos, 1);
+    while (pos < size) {
+        buf_len = func((const unsigned char *) str, size, pos, &status, &cp);
+        add_next_index_stringl(return_value, str + pos, buf_len, 1);
+        pos += buf_len;
     }
 }
 
@@ -699,11 +530,12 @@ PHP_FUNCTION(str_each_char)
     int size;
     char *charset_hint;
     size_t charset_hint_size;
-    enum entity_charset charset;
+
+    next_char_func func;
     size_t pos = 0;
-    size_t next_pos = 0;
+    size_t buf_len = 0;
     int status = 0;
-    unsigned int this_char;
+    unsigned int cp = 0;
 
     smart_str buf = {0};
     int index = 0;
@@ -715,15 +547,13 @@ PHP_FUNCTION(str_each_char)
     zval *key = NULL;
     zval *retval_ptr = NULL;
 
-    charset_hint = "UTF-8";
-
-if (zend_parse_parameters(
-            ZEND_NUM_ARGS() TSRMLS_CC, "sf|s", &str, &size, &fci, &fci_cache, &charset_hint, &charset_hint_size) == FAILURE
+    if (zend_parse_parameters(
+        ZEND_NUM_ARGS() TSRMLS_CC, "sf|s", &str, &size, &fci, &fci_cache, &charset_hint, &charset_hint_size) == FAILURE
     ) {
         return;
     }
 
-    charset = determine_charset(charset_hint TSRMLS_CC);
+    func = get_next_func(charset_hint);
 
     MAKE_STD_ZVAL(value);
     MAKE_STD_ZVAL(key);
@@ -736,11 +566,10 @@ if (zend_parse_parameters(
     fci.no_separation = 0;
     fci.retval_ptr_ptr = &retval_ptr;
 
-    while (next_pos < size) {
-        pos = next_pos;
-        this_char = get_next_char(charset, (const unsigned char *) str, size, &next_pos, &status);
+    while (pos < size) {
+        buf_len = func((const unsigned char *) str, size, pos, &status, &cp);
 
-        ZVAL_STRINGL(value, str + pos, next_pos - pos, 1);
+        ZVAL_STRINGL(value, str + pos, buf_len, 1);
         ZVAL_LONG(key, index);
 
         if (zend_call_function(&fci, &fci_cache TSRMLS_CC) == SUCCESS && fci.retval_ptr_ptr && *fci.retval_ptr_ptr) {
@@ -748,6 +577,7 @@ if (zend_parse_parameters(
             smart_str_appendl(&buf, Z_STRVAL_P(retval_ptr), Z_STRLEN_P(retval_ptr));
         }
 
+        pos += buf_len;
         ++index;
 
     }
@@ -771,11 +601,12 @@ PHP_FUNCTION(str_take_while)
     int size;
     char *charset_hint;
     size_t charset_hint_size;
-    enum entity_charset charset;
+
+    next_char_func func;
     size_t pos = 0;
-    size_t next_pos = 0;
+    size_t buf_len = 0;
     int status = 0;
-    unsigned int this_char;
+    unsigned int cp = 0;
 
     smart_str buf = {0};
     int index = 0;
@@ -787,15 +618,13 @@ PHP_FUNCTION(str_take_while)
     zval *key = NULL;
     zval *retval_ptr = NULL;
 
-    charset_hint = "UTF-8";
-
-if (zend_parse_parameters(
-            ZEND_NUM_ARGS() TSRMLS_CC, "sf|s", &str, &size, &fci, &fci_cache, &charset_hint, &charset_hint_size) == FAILURE
+    if (zend_parse_parameters(
+        ZEND_NUM_ARGS() TSRMLS_CC, "sf|s", &str, &size, &fci, &fci_cache, &charset_hint, &charset_hint_size) == FAILURE
     ) {
         return;
     }
 
-    charset = determine_charset(charset_hint TSRMLS_CC);
+    func = get_next_func(charset_hint);
 
     MAKE_STD_ZVAL(value);
     MAKE_STD_ZVAL(key);
@@ -808,11 +637,10 @@ if (zend_parse_parameters(
     fci.no_separation = 0;
     fci.retval_ptr_ptr = &retval_ptr;
 
-    while (next_pos < size) {
-        pos = next_pos;
-        this_char = get_next_char(charset, (const unsigned char *) str, size, &next_pos, &status);
+    while (pos < size) {
+        buf_len = func((const unsigned char *) str, size, pos, &status, &cp);
 
-        ZVAL_STRINGL(value, str + pos, next_pos - pos, 1);
+        ZVAL_STRINGL(value, str + pos, buf_len, 1);
         ZVAL_LONG(key, index);
 
         if (zend_call_function(&fci, &fci_cache TSRMLS_CC) == SUCCESS
@@ -823,9 +651,10 @@ if (zend_parse_parameters(
                 break;
             }
 
-            smart_str_appendl(&buf, str + pos, next_pos - pos);  
+            smart_str_appendl(&buf, str + pos, buf_len);  
         }
 
+        pos += buf_len;
         ++index;
     }
 
@@ -848,11 +677,12 @@ PHP_FUNCTION(str_drop_while)
     int size;
     char *charset_hint;
     size_t charset_hint_size;
-    enum entity_charset charset;
+
+    next_char_func func = utf8_next_char;
     size_t pos = 0;
-    size_t next_pos = 0;
+    size_t buf_len = 0;
     int status = 0;
-    unsigned int this_char;
+    unsigned int cp = 0;
 
     smart_str buf = {0};
     int index = 0;
@@ -866,15 +696,13 @@ PHP_FUNCTION(str_drop_while)
 
     zend_bool checked = false;
 
-    charset_hint = "UTF-8";
-
-if (zend_parse_parameters(
-            ZEND_NUM_ARGS() TSRMLS_CC, "sf|s", &str, &size, &fci, &fci_cache, &charset_hint, &charset_hint_size) == FAILURE
+    if (zend_parse_parameters(
+        ZEND_NUM_ARGS() TSRMLS_CC, "sf|s", &str, &size, &fci, &fci_cache, &charset_hint, &charset_hint_size) == FAILURE
     ) {
         return;
     }
 
-    charset = determine_charset(charset_hint TSRMLS_CC);
+    func = get_next_func(charset_hint);
 
     MAKE_STD_ZVAL(value);
     MAKE_STD_ZVAL(key);
@@ -887,11 +715,11 @@ if (zend_parse_parameters(
     fci.no_separation = 0;
     fci.retval_ptr_ptr = &retval_ptr;
 
-    while (next_pos < size) {
-        pos = next_pos;
-        this_char = get_next_char(charset, (const unsigned char *) str, size, &next_pos, &status);
+    while (pos < size) {
 
-        ZVAL_STRINGL(value, str + pos, next_pos - pos, 1);
+        buf_len = func((const unsigned char *) str, size, pos, &status, &cp);
+
+        ZVAL_STRINGL(value, str + pos, buf_len, 1);
         ZVAL_LONG(key, index);
 
         if (zend_call_function(&fci, &fci_cache TSRMLS_CC) == SUCCESS
@@ -903,11 +731,12 @@ if (zend_parse_parameters(
             }
 
             if (checked) {
-                smart_str_appendl(&buf, str + pos, next_pos - pos); 
+                smart_str_appendl(&buf, str + pos, buf_len); 
             }
  
         }
 
+        pos += buf_len;
         ++index;
     }
 

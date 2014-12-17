@@ -80,65 +80,6 @@ ZEND_END_MODULE_GLOBALS(stringutils)
 
 #endif	/* PHP_STRINGUTILS_H */
 
-/* https://github.com/php/php-src/blob/master/ext/standard/html_tables.h */
-
-enum entity_charset { cs_utf_8, cs_8859_1, cs_cp1252, cs_8859_15, cs_cp1251,
-            cs_8859_5, cs_cp866, cs_macroman, cs_koi8r, cs_big5,
-            cs_gb2312, cs_big5hkscs, cs_sjis, cs_eucjp,
-            cs_numelems /* used to count the number of charsets */
-          };
-
-static const struct {
-  const char *codeset;
-  enum entity_charset charset;
-} charset_map[] = {
-  { "ISO-8859-1",   cs_8859_1 },
-  { "ISO8859-1",    cs_8859_1 },
-  { "ISO-8859-15",  cs_8859_15 },
-  { "ISO8859-15",   cs_8859_15 },
-  { "utf-8",      cs_utf_8 },
-  { "cp1252",     cs_cp1252 },
-  { "Windows-1252", cs_cp1252 },
-  { "1252",     cs_cp1252 }, 
-  { "BIG5",     cs_big5 },
-  { "950",      cs_big5 },
-  { "GB2312",     cs_gb2312 },
-  { "936",      cs_gb2312 },
-  { "BIG5-HKSCS",   cs_big5hkscs },
-  { "Shift_JIS",    cs_sjis },
-  { "SJIS",     cs_sjis },
-  { "932",      cs_sjis },
-  { "SJIS-win",   cs_sjis },
-  { "CP932",      cs_sjis },
-  { "EUCJP",      cs_eucjp },
-  { "EUC-JP",     cs_eucjp },
-  { "eucJP-win",    cs_eucjp },
-  { "KOI8-R",     cs_koi8r },
-  { "koi8-ru",    cs_koi8r },
-  { "koi8r",      cs_koi8r },
-  { "cp1251",     cs_cp1251 },
-  { "Windows-1251", cs_cp1251 },
-  { "win-1251",   cs_cp1251 },
-  { "iso8859-5",    cs_8859_5 },
-  { "iso-8859-5",   cs_8859_5 },
-  { "cp866",      cs_cp866 },
-  { "866",      cs_cp866 },    
-  { "ibm866",     cs_cp866 },
-  { "MacRoman",   cs_macroman },
-  { NULL }
-};
-
-
-static unsigned int get_next_char(
-    enum entity_charset,
-    const unsigned char *,
-    size_t,
-    size_t*,
-    int*
-);
-
-static enum entity_charset determine_charset(char *charset_hint TSRMLS_DC);
-
 /*
  * Local variables:
  * tab-width: 4
